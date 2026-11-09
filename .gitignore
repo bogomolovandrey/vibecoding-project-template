@@ -1,0 +1,17 @@
+# Секреты
+.env
+.env.*
+!.env.example
+
+# Локальные настройки агентов
+.claude/settings.local.json
+.claude/worktrees/
+.playwright-mcp/
+
+# Скриншоты проверок
+test-screenshots/*
+!test-screenshots/.gitkeep
+
+# Мусор
+.DS_Store
+tmp/

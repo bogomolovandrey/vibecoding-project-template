@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# codex-audit — independent audit of a document (plan/spec/FR) via the local
+# `codex` CLI, read-only over the repository so claims can be checked against code.
+#
+# Usage:
+#   codex-audit --file <doc.md> [--focus "..."] [--context <path>]... \
+#               [--out <findings.md>] [--cd <repo-root>] [--timeout <seconds>]
+#
+# Output:
+#   On success the LAST line of stdout is:   OK <absolute-path-to-findings>
+#
+# Env:
+#   CODEX_AUDIT_CODEX_BIN   Force a specific codex binary (skips auto-resolution).
+#   CODEX_AUDIT_REASONING   model_reasoning_effort for codex (default: high).
+#
+set -euo pipefail
+
+err() { printf 'codex-audit: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+resolve_codex() {
+  local c
+  if [[ -n "${CODEX_AUDIT_CODEX_BIN:-}" ]]; then
+    "${CODEX_AUDIT_CODEX_BIN}" --version >/dev/null 2>&1 \
+      && { printf '%s' "${CODEX_AUDIT_CODEX_BIN}"; return 0; }
+    die "CODEX_AUDIT_CODEX_BIN=${CODEX_AUDIT_CODEX_BIN} does not run"
+  fi
+  # Resolve PATH symlinks to the real binary: codex looks for its helper
+  # `codex-code-mode-host` NEXT TO the invoked path, so a bare symlink in
+  # /opt/homebrew/bin runs but fails to read files ("code mode fail closed").
+  if c="$(command -v codex 2>/dev/null)"; then
+    c="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$c")"
+    "$c" --version >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  fi
+  local app
+  for app in \
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex" \
+    "/Applications/ChatGPT.app/Contents/Resources/codex" \
+    "/Applications/Codex.app/Contents/Resources/codex" \
+    "/Applications/ChatGPT Classic.app/Contents/Resources/codex" \
+    "/Applications/ChatGPT Atlas.app/Contents/Resources/codex"; do
+    if [[ -x "$app" ]] && "$app" --version >/dev/null 2>&1; then
+      printf '%s' "$app"; return 0
+    fi
+  done
+  die "no working codex CLI found (desktop app binary missing?). Set CODEX_AUDIT_CODEX_BIN."
+}
+
+FILE="" OUT="" CD="" FOCUS="" TIMEOUT="900"
+CONTEXTS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --file)    FILE="${2:?--file needs a value}"; shift 2 ;;
+    --out)     OUT="${2:?--out needs a value}"; shift 2 ;;
+    --cd)      CD="${2:?--cd needs a value}"; shift 2 ;;
+    --focus)   FOCUS="${2:?--focus needs a value}"; shift 2 ;;
+    --context) CONTEXTS+=("${2:?--context needs a value}"); shift 2 ;;
+    --timeout) TIMEOUT="${2:?--timeout needs a value}"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *)         die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$FILE" ]] || die "--file is required"
+case "$FILE" in /*) : ;; *) FILE="$PWD/$FILE" ;; esac
+[[ -f "$FILE" ]] || die "file not found: $FILE"
+[[ -n "$OUT" ]] || OUT="${FILE%.md}.audit.md"
+case "$OUT" in /*) : ;; *) OUT="$PWD/$OUT" ;; esac
+[[ -n "$CD" ]] || CD="$(git -C "$(dirname "$FILE")" rev-parse --show-toplevel 2>/dev/null || dirname "$FILE")"
+
+ctx_lines=""
+for c in "${CONTEXTS[@]:-}"; do
+  [[ -z "$c" ]] && continue
+  case "$c" in /*) : ;; *) c="$PWD/$c" ;; esac
+  [[ -e "$c" ]] || die "context path not found: $c"
+  ctx_lines+="- ${c}"$'\n'
+done
+
+focus_line=""
+[[ -n "$FOCUS" ]] && focus_line="Особые акценты аудита: ${FOCUS}"
+
+read -r -d '' INSTRUCTION <<EOF || true
+Ты — придирчивый технический аудитор. Проведи аудит документа:
+${FILE}
+
+Дополнительный контекст (обязательно прочитай):
+${ctx_lines:-«нет»}
+
+Репозиторий доступен только на чтение — сверяй утверждения документа с реальным кодом, где это уместно.
+${focus_line}
+
+Ищи: фактические ошибки; противоречия внутри документа и с кодом; пропущенные сценарии и краевые случаи; риски (особенно деньги и данные: двойные операции, потерянные записи, гонки, идемпотентность); нереалистичные допущения; места, где документ недоопределён и исполнитель примет неверное решение.
+
+НЕ предлагай переписать документ и НЕ генерируй новый план. Верни ТОЛЬКО нумерованный список замечаний в markdown. Формат каждого пункта:
+### N. <краткий заголовок>
+- **Серьёзность:** critical | major | minor
+- **Где:** раздел/цитата документа
+- **Суть:** что не так, с доказательством (ссылка на код/док, если проверял)
+- **Предложение:** минимальная правка
+
+Отсортируй по серьёзности. Если замечаний по какой-то теме нет — не выдумывай; лучше 8 настоящих пунктов, чем 25 натянутых. Избегай предложений, требующих новых подсистем, если задача решается строчкой в существующей.
+EOF
+
+CODEX="$(resolve_codex)"
+err "using codex: $CODEX"
+err "auditing $FILE -> $OUT (cd=$CD, timeout=${TIMEOUT}s)"
+
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout";
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; fi
+
+mkdir -p "$(dirname "$OUT")"
+set +e
+if [[ -n "$TIMEOUT_BIN" ]]; then
+  "$TIMEOUT_BIN" "$TIMEOUT" "$CODEX" exec --skip-git-repo-check --sandbox read-only -C "$CD" \
+    -c "model_reasoning_effort=${CODEX_AUDIT_REASONING:-high}" \
+    --output-last-message "$OUT" "$INSTRUCTION" >&2
+else
+  "$CODEX" exec --skip-git-repo-check --sandbox read-only -C "$CD" \
+    -c "model_reasoning_effort=${CODEX_AUDIT_REASONING:-high}" \
+    --output-last-message "$OUT" "$INSTRUCTION" >&2
+fi
+rc=$?
+set -e
+
+[[ $rc -eq 124 ]] && die "codex timed out after ${TIMEOUT}s"
+[[ -s "$OUT" ]] || die "codex produced no findings file (rc=$rc)"
+printf 'OK %s\n' "$OUT"
